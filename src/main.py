@@ -4,12 +4,11 @@ import argparse
 import torch
 import glob
 import signal
-from train import train_sae
 
 # Local imports
-import data
-import sae_factory
-import metric
+from . import data
+from . import sae_factory
+from . import metric
 
 # --- Configuration ---
 CONFIG = {

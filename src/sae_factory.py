@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 from overcomplete.sae import TopKSAE, RATopKSAE
-from utils import cosine_kmeans
+from .utils import cosine_kmeans
 
 def get_sae_model(model_type, d_brain, d_model, k, device, dataloader, config):
     """

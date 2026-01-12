@@ -4,9 +4,7 @@ import argparse
 import torch
 import glob
 import signal
-from train import train_sae
-from overcomplete.sae.train import extract_input
-from train import _compute_reconstruction_error
+from .train import train_sae
 
 # Local imports
 import data

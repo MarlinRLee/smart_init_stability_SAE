@@ -3,7 +3,7 @@ import numpy as np
 import faiss
 from tqdm import tqdm
 import overcomplete.metrics as om
-import metric as lm
+from . import metric as lm
 
 
 def cosine_kmeans(dataloader, n_clusters, n_dims, max_samples=8_192_000, seed=42):
