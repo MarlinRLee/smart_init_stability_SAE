@@ -6,10 +6,10 @@ import glob
 import signal
 
 # Local imports
-from .data import get_dataset_stats, GPUNormalizer, create_dataloader, DeviceDataLoader, create_val_dataloader
-from .sae_factory import get_sae_model
-from .metric import evaluate_sae, compute_pairwise_stability
-from .train import train_sae
+from data import get_dataset_stats, GPUNormalizer, create_dataloader, DeviceDataLoader, create_val_dataloader
+from sae_factory import get_sae_model
+from metric import evaluate_sae, compute_pairwise_stability
+from train import train_sae
 
 
 # --- Configuration ---
