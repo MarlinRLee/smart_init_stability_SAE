@@ -3,7 +3,6 @@ import numpy as np
 import faiss
 from tqdm import tqdm
 import overcomplete.metrics as om
-from . import metric as lm
 
 
 def cosine_kmeans(dataloader, n_clusters, n_dims, max_samples=8_192_000, seed=42):
@@ -147,7 +146,5 @@ def evaluate_sae_stream(sae, dataloader, device, subsample_size=10000):
         'avg_hoyer': stats['hoyer_sum'] / N,
         'dead_features_pct': (~stats['dead_features']).float().mean().item(),
         'data_alignment_score': 1.0 - max_cosines.mean().item(), # 1 - avg_max_cosine
-        # Buffered Metrics
-        'avg_connectivity': lm.average_feature_connectivity(torch.cat(buffer_codes))
     }
     return results, sae.get_dictionary().detach()

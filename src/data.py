@@ -89,7 +89,7 @@ class DeviceDataLoader:
 
 # --- 4. The Setup Function ---
 def create_dataloader(shard_dir, total_batch_size, num_workers=16, prefetch_factor=6, 
-                      subset_fraction=.05, shuffle=True):
+                      subset_fraction=.1, shuffle=True):
     """
     Create a dataloader for sharded data.
     

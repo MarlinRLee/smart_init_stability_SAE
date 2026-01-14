@@ -215,7 +215,6 @@ def validate(model, val_loader, criterion, device):
         'val_l0': total_l0 / batch_count if batch_count > 0 else 0.0,  # Per-sample average
     }
 
-
 def train_sae(model, dataloader, criterion, optimizer, scheduler=None,
               nb_epochs=20, clip_grad=1.0, monitoring=1, device="cpu", sae_index=1,
               checkpoint_dir=None, checkpoint_every_n_epochs=1, model_type=None,

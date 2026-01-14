@@ -6,16 +6,18 @@ import glob
 import signal
 
 # Local imports
-from . import data
-from . import sae_factory
-from . import metric
+from .data import get_dataset_stats, GPUNormalizer, create_dataloader, DeviceDataLoader, create_val_dataloader
+from .sae_factory import get_sae_model
+from .metric import evaluate_sae, compute_pairwise_stability
+from .train import train_sae
+
 
 # --- Configuration ---
 CONFIG = {
     'num_saes': 2,
     'd_model': 10_000,
     'k_fraction': 0.01,
-    'epochs': 50,
+    'epochs': 20,
     'batch_size': 16_384*2,
     'prefetch_factor': 2,
     'num_workers': 8,
@@ -150,15 +152,15 @@ def main():
     d_brain = first_shard.shape[-1]
     print(f"Detected embedding dimension: {d_brain}")
 
-    mean, std = data.get_dataset_stats(args.shard_directory)
-    normalizer = data.GPUNormalizer(mean, std).to(device)
-    raw_loader = data.create_dataloader(
+    mean, std = get_dataset_stats(args.shard_directory)
+    normalizer = GPUNormalizer(mean, std).to(device)
+    raw_loader = create_dataloader(
         args.shard_directory, 
         CONFIG['batch_size'], 
         num_workers=CONFIG['num_workers'], 
         prefetch_factor=CONFIG['prefetch_factor']
     )
-    loader = data.DeviceDataLoader(raw_loader, device, normalizer)
+    loader = DeviceDataLoader(raw_loader, device, normalizer)
     
     # --- Validation Data ---
     val_loader = None
@@ -173,21 +175,21 @@ def main():
             
             # Try to get validation stats, fall back to training stats
             try:
-                val_mean, val_std = data.get_dataset_stats(args.val_dir)
-                val_normalizer = data.GPUNormalizer(val_mean, val_std).to(device)
+                val_mean, val_std = get_dataset_stats(args.val_dir)
+                val_normalizer = GPUNormalizer(val_mean, val_std).to(device)
                 print("Using validation-specific normalization stats")
             except FileNotFoundError:
                 print("No validation stats found, using training stats for normalization")
                 val_normalizer = normalizer
             
-            raw_val_loader = data.create_val_dataloader(
+            raw_val_loader = create_val_dataloader(
                 args.val_dir,
                 CONFIG['val_batch_size'],
                 num_workers=CONFIG['val_num_workers'],
                 prefetch_factor=2,
                 subset_fraction=CONFIG['val_subset_fraction']
             )
-            val_loader = data.DeviceDataLoader(raw_val_loader, device, val_normalizer)
+            val_loader = DeviceDataLoader(raw_val_loader, device, val_normalizer)
             print(f"Validation enabled with {len(val_shard_files)} shards "
                   f"(using {CONFIG['val_subset_fraction']*100:.0f}%)")
             
@@ -225,14 +227,14 @@ def main():
         
         if os.path.exists(save_path) and is_training_complete(checkpoint_dir, i, CONFIG['epochs']):
             print(f"Loading existing completed model from {save_path}")
-            sae = sae_factory.get_sae_model(
+            sae = get_sae_model(
                 args.model_type, d_brain, CONFIG['d_model'], k, device, loader, CONFIG
             )
             sae.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
         else:
             print("Training (will resume from checkpoint if available)...")
             
-            sae = sae_factory.get_sae_model(
+            sae = get_sae_model(
                 args.model_type, d_brain, CONFIG['d_model'], k, device, loader, CONFIG
             )
             
@@ -297,7 +299,7 @@ def main():
         
         print("Running evaluation...")
         with torch.inference_mode():
-            metrics, dictionary = metric.evaluate_sae(sae, loader, device)
+            metrics, dictionary = evaluate_sae(sae, loader, device)
         
         all_results[f"sae_{i}"] = metrics
         all_dictionaries.append(dictionary)
@@ -326,7 +328,7 @@ def main():
         vals = [all_results[f"sae_{j}"][key] for j in range(1, CONFIG['num_saes'] + 1)]
         avg_metrics[f"avg_{key}"] = sum(vals) / len(vals)
 
-    stability_metrics = metric.compute_pairwise_stability(all_dictionaries, device)
+    stability_metrics = compute_pairwise_stability(all_dictionaries, device)
     
     final_output = {
         "CONFIG": CONFIG,

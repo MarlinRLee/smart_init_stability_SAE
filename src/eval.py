@@ -4,7 +4,7 @@ import argparse
 import torch
 import glob
 import signal
-from .train import train_sae
+from train import train_sae
 
 # Local imports
 import data
