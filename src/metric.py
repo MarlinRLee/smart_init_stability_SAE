@@ -211,14 +211,17 @@ class StreamingNegativeInterference:
     """Accumulate Z^T Z for negative interference computation."""
     def __init__(self, num_codes, device):
         self.ZTZ = torch.zeros(num_codes, num_codes, device=device)
-    
+        self.n_samples = 0
+
     def update(self, z):
         # z: (batch, num_codes)
         self.ZTZ += torch.matmul(z.T, z)
-    
+        self.n_samples += z.shape[0]
+
     def compute(self, D):
+        ZTZ = self.ZTZ / max(self.n_samples, 1)
         DDT = torch.matmul(D, D.T)
-        product = self.ZTZ * DDT
+        product = ZTZ * DDT
         neg_interference = torch.relu(-product)
         return neg_interference.norm().item()
 
@@ -304,6 +307,33 @@ def evaluate_sae(sae, dataloader, device):
     }
     
     return metrics, D.cpu()
+
+
+def aggregate_metrics(all_results):
+    """
+    Compute average metrics across multiple SAE results.
+
+    Parameters
+    ----------
+    all_results : dict
+        Mapping of SAE keys to metric dicts, e.g. {"sae_1": {...}, "sae_2": {...}}.
+
+    Returns
+    -------
+    dict
+        Averaged metrics with "avg_" prefix.
+    """
+    if not all_results:
+        return {}
+    avg_metrics = {}
+    all_keys = set()
+    for metrics in all_results.values():
+        all_keys.update(metrics.keys())
+    for key in all_keys:
+        vals = [m[key] for m in all_results.values() if key in m]
+        if vals:
+            avg_metrics[f"avg_{key}"] = sum(vals) / len(vals)
+    return avg_metrics
 
 
 def compute_pairwise_stability(dictionaries, device):

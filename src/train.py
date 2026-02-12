@@ -65,6 +65,7 @@ def save_checkpoint(checkpoint_dir, sae_index, epoch, global_step, model, optimi
         'optimizer_state_dict': optimizer.state_dict(),
         'logs': dict(logs),
         'best_loss': best_loss,
+        'training_complete': False,
     }
     
     if scheduler is not None:
@@ -92,7 +93,7 @@ def load_checkpoint(checkpoint_dir, sae_index, model, optimizer, scheduler=None,
         return None
     
     print(f"  [Checkpoint] Loading from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -183,36 +184,52 @@ class EarlyStopping:
             self.best_epoch = state['best_epoch']
 
 
-def validate(model, val_loader, criterion, device):
-    """Run validation on the validation set."""
+def validate(model, val_loader, criterion, device, omnipresent_threshold=0.9):
+    """Run validation and calculate feature density/omnipresence."""
     model.eval()
-    
+
     total_loss = 0.0
     total_r2 = 0.0
-    total_l0 = 0.0
     total_samples = 0
     batch_count = 0
-    
+
+    # Infer dictionary size from the model
+    d_sae = model.get_dictionary().shape[0]
+    feature_acts_count = torch.zeros(d_sae, device=device)
+
     with torch.no_grad():
         for batch in val_loader:
-            x = extract_input(batch).to(device, non_blocking=True)
+            x = extract_input(batch)  # already on device via DeviceDataLoader
             x = x.float()
             
             z_pre, z, x_hat = model(x)
             loss = criterion(x, x_hat, z_pre, z, model.get_dictionary())
             
+            # Update metrics
             total_loss += loss.item()
             total_r2 += _compute_reconstruction_error(x, x_hat)
-            total_l0 += l0_eps(z, 0).sum().item()
             total_samples += x.shape[0]
             batch_count += 1
+            
+            feature_acts_count += (z > 0).float().sum(dim=0)
     
+    # Calculate frequency per feature
+    feature_freqs = feature_acts_count / total_samples
+    
+    # Calculate omnipresent percentage
+    omnipresent_mask = feature_freqs >= omnipresent_threshold
+    pct_omnipresent = omnipresent_mask.float().mean().item() * 100
+    
+    # Calculate dead features (never fire) for comparison
+    pct_dead = (feature_freqs == 0).float().mean().item() * 100
+
     model.train()
     
     return {
         'val_loss': total_loss / batch_count if batch_count > 0 else float('inf'),
         'val_r2': total_r2 / batch_count if batch_count > 0 else 0.0,
-        'val_l0': total_l0 / batch_count if batch_count > 0 else 0.0,  # Per-sample average
+        'val_omnipresent': pct_omnipresent,
+        'val_dead': pct_dead
     }
 
 def train_sae(model, dataloader, criterion, optimizer, scheduler=None,
@@ -319,14 +336,14 @@ def train_sae(model, dataloader, criterion, optimizer, scheduler=None,
             print(f"  Early stopping enabled (patience={early_stopping_patience}, min_delta={early_stopping_min_delta})")
 
     frozen = False
-    if model_type == "SI-SAE" and start_epoch < 10:
+    if model_type == "SI-SAE" and start_epoch < 2:
         for param in model.dictionary.parameters():
             param.requires_grad = False
         frozen = True
             
             
     for epoch in range(start_epoch, nb_epochs):
-        if frozen and epoch >= 10:
+        if frozen and epoch >= 2:
             for param in model.dictionary.parameters():
                 param.requires_grad = True
             print("unfreeze dict", flush = True)
@@ -346,7 +363,7 @@ def train_sae(model, dataloader, criterion, optimizer, scheduler=None,
             global_step += 1
             batch_count += 1
             
-            x = extract_input(batch).to(device, non_blocking=True)
+            x = extract_input(batch)  # already on device via DeviceDataLoader
             
             optimizer.zero_grad(set_to_none=True)
 
@@ -433,11 +450,11 @@ def train_sae(model, dataloader, criterion, optimizer, scheduler=None,
             val_metrics = validate(model, val_loader, criterion, device)
             
             logs['val_loss'].append(val_metrics['val_loss'])
-            logs['val_r2'].append(val_metrics['val_r2'])
-            logs['val_l0'].append(val_metrics['val_l0'])
+            logs['val_omnipresent'].append(val_metrics['val_omnipresent'])
             
             val_msg = (f" | Val - Loss: {val_metrics['val_loss']:.4f}, "
-                      f"R2: {val_metrics['val_r2']:.4f}, L0: {val_metrics['val_l0']:.4f}")
+                    f"R2: {val_metrics['val_r2']:.4f}, "
+                    f"Omni: {val_metrics['val_omnipresent']:.2f}%")
             
             # Early stopping check
             if early_stopper is not None:
@@ -473,11 +490,16 @@ def train_sae(model, dataloader, criterion, optimizer, scheduler=None,
             save_checkpoint(checkpoint_dir, sae_index, epoch, global_step, 
                           model, optimizer, scheduler, logs, best_loss, early_stopping_state)
 
-    # Final checkpoint (only if not early stopped)
-    if checkpoint_dir and (early_stopper is None or not early_stopper.early_stop):
+    # Final checkpoint
+    if checkpoint_dir:
         early_stopping_state = early_stopper.get_state() if early_stopper else None
-        save_checkpoint(checkpoint_dir, sae_index, nb_epochs - 1, global_step,
+        final_epoch = epoch if (early_stopper and early_stopper.early_stop) else nb_epochs - 1
+        ckpt_path = save_checkpoint(checkpoint_dir, sae_index, final_epoch, global_step,
                        model, optimizer, scheduler, logs, best_loss, early_stopping_state)
+        # Mark training as complete (normal finish or early stop)
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=True)
+        ckpt['training_complete'] = True
+        torch.save(ckpt, ckpt_path)
 
     # Summary
     if val_loader is not None:

@@ -2,7 +2,6 @@ import torch
 import numpy as np
 import faiss
 from tqdm import tqdm
-import overcomplete.metrics as om
 
 
 def cosine_kmeans(dataloader, n_clusters, n_dims, max_samples=8_192_000, seed=42):
@@ -86,65 +85,3 @@ def cosine_kmeans(dataloader, n_clusters, n_dims, max_samples=8_192_000, seed=42
     centroids = torch.nn.functional.normalize(centroids, p=2, dim=1)
     
     return centroids
-
-
-
-def evaluate_sae_stream(sae, dataloader, device, subsample_size=10000):
-    """Streams data to compute R2, Alignment, Sparsity, and Connectivity."""
-    sae.eval()
-    sae.to(device)
-    
-    d_sae = sae.get_dictionary().shape[0]
-    
-    # Metrics Accumulators
-    stats = {
-        'l2_num': 0.0, 'l2_den': 0.0, 'l0_sum': 0.0, 'hoyer_sum': 0.0,
-        'total_samples': 0, 'dead_features': torch.zeros(d_sae, device=device, dtype=torch.bool)
-    }
-    
-    # Alignment Setup
-    dict_norm = torch.nn.functional.normalize(sae.get_dictionary().detach(), p=2, dim=1)
-    max_cosines = torch.full((d_sae,), -1.0, device=device)
-    
-    # Buffers for expensive metrics
-    buffer_x, buffer_codes = [], []
-    buffer_count = 0
-    
-    print("Streaming Evaluation...")
-    with torch.no_grad(), torch.amp.autocast(device_type=device, dtype=torch.float32):
-        for (x,) in dataloader:
-            x = x.to(device)
-            pre_codes, codes, x_hat = sae(x)
-            
-            # 1. Basic Loss
-            stats['l2_num'] += (x_hat - x).square().sum().item()
-            stats['l2_den'] += x.square().sum().item()
-            stats['total_samples'] += x.shape[0]
-            
-            # 2. Sparsity
-            stats['l0_sum'] += om.l0(codes).sum().item()
-            stats['hoyer_sum'] += om.hoyer(codes).sum().item()
-            stats['dead_features'] |= (codes.abs() > 1e-6).any(dim=0)
-
-            # 3. Alignment (Max Correlation)
-            x_norm = torch.nn.functional.normalize(x, p=2, dim=1)
-            batch_cos = torch.matmul(x_norm, dict_norm.T)
-            max_cosines = torch.maximum(max_cosines, batch_cos.max(dim=0).values)
-            
-            # 4. Buffer
-            if buffer_count < subsample_size:
-                take = min(subsample_size - buffer_count, x.shape[0])
-                buffer_x.append(x[:take].cpu())
-                buffer_codes.append(codes[:take].cpu())
-                buffer_count += take
-
-    # Final Calculations
-    N = stats['total_samples']
-    results = {
-        'r2_score': 1.0 - (stats['l2_num'] / stats['l2_den']),
-        'avg_l0': stats['l0_sum'] / N,
-        'avg_hoyer': stats['hoyer_sum'] / N,
-        'dead_features_pct': (~stats['dead_features']).float().mean().item(),
-        'data_alignment_score': 1.0 - max_cosines.mean().item(), # 1 - avg_max_cosine
-    }
-    return results, sae.get_dictionary().detach()

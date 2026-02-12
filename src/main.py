@@ -3,70 +3,63 @@ import json
 import argparse
 import torch
 import glob
-import signal
 
 # Local imports
 from data import get_dataset_stats, GPUNormalizer, create_dataloader, DeviceDataLoader, create_val_dataloader
 from sae_factory import get_sae_model
-from metric import evaluate_sae, compute_pairwise_stability
+from metric import evaluate_sae, compute_pairwise_stability, aggregate_metrics
 from train import train_sae
+from common import GracefulKiller, get_checkpoint_dir, is_training_complete
+from eval import run_evaluation
 
 
 # --- Configuration ---
 CONFIG = {
-    'num_saes': 2,
-    'd_model': 10_000,
+    'num_saes': 1,
+    'd_model': 5_000,
     'k_fraction': 0.01,
-    'epochs': 20,
-    'batch_size': 16_384*2,
+    'epochs': 40,
+    'batch_size': 16_384,
     'prefetch_factor': 2,
     'num_workers': 8,
     'lr': 1e-3,
+    # Approximate number of samples in the training dataset
+    'dataset_size': 250_000_000,
     #RA SAE:
     'n_candidates': 32_000,
-    'delta': 0.1,
+    'delta': 1.0,
     #SI SAE
-    'per_init': 0.0,
-    
+    'per_init': 0.1,
+
     #Meta or validation
     'checkpoint_every_n_epochs': 5,
     # Validation and early stopping settings
     'val_batch_size': 16_384,  # Batch size for validation
     'val_num_workers': 4,      # Workers for validation loader
     'val_subset_fraction': 1.0, # Use all validation data (or reduce for speed)
-    'early_stopping_patience': 10,  # Stop if no improvement for N epochs
+    'early_stopping_patience': 5,  # Stop if no improvement for N epochs
     'early_stopping_min_delta': 0,  # Minimum improvement to count
 }
 
 
-class GracefulKiller:
-    """Handle SIGTERM/SIGINT for graceful shutdown."""
-    kill_now = False
-    
-    def __init__(self):
-        signal.signal(signal.SIGINT, self.exit_gracefully)
-        signal.signal(signal.SIGTERM, self.exit_gracefully)
-    
-    def exit_gracefully(self, signum, frame):
-        print("\n[Signal] Received shutdown signal. Will save checkpoint after current epoch...")
-        self.kill_now = True
-
-def get_checkpoint_dir(base_dir, model_type, run_suffix):
-    """Get checkpoint directory with specific model parameters."""
-    checkpoint_dir = os.path.join(base_dir, f"checkpoints_{model_type}{run_suffix}")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    return checkpoint_dir
+def criterion(x, x_hat, pre_codes, codes, dictionary):
+    """Reconstruction loss"""
+    loss = (x - x_hat).square().mean()
 
 
-def is_training_complete(checkpoint_dir, sae_index, total_epochs):
-    """Check if training for a specific SAE is already complete."""
-    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_sae_{sae_index}.pt')
-    if not os.path.exists(checkpoint_path):
-        return False
-    
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    return checkpoint['epoch'] >= total_epochs - 1
+    return loss
+
+
+def build_run_suffix(model_type, config):
+    """Build a descriptive suffix for checkpoint/output file naming."""
+    k = int(config['k_fraction'] * config['d_model'])
+    run_suffix = f"_d{config['d_model']}_k{k}"
+    if model_type == "RA-SAE":
+        run_suffix += f"_delta{config['delta']}"
+    elif model_type == "SI-SAE":
+        run_suffix += f"_per_init{config['per_init']}"
+    return run_suffix
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train SAE with checkpointing support")
@@ -76,15 +69,22 @@ def main():
                         help="Base directory for checkpoints")
     parser.add_argument("--output-dir", type=str, default="../trained_models",
                         help="Directory for final trained models")
+    parser.add_argument("--centers-dir", type=str, default="../centers",
+                        help="Directory for pre-computed centers files")
     parser.add_argument("--epochs", type=int, default=None,
                         help="Override number of epochs")
     parser.add_argument("--checkpoint-every", type=int, default=None,
                         help="Save checkpoint every N epochs")
-    parser.add_argument("--start-sae", type=int, default=1,
-                        help="Start from SAE index (1-based)")
-    parser.add_argument("--single-sae", type=int, default=None,
-                        help="Train only this SAE index (1-based)")
-    
+
+    parser.add_argument("--k-fraction", type=float, default=None,
+                        help="Override k_fraction (e.g., 0.01, 0.05, 0.1)")
+    parser.add_argument("--per-init", type=float, default=None,
+                        help="Override per_init for SI-SAE (e.g., 0, 0.01, 0.1, 0.4, 0.8)")
+
+    # Eval-only mode
+    parser.add_argument("--eval-only", action="store_true",
+                        help="Skip training; load saved models and run evaluation only.")
+
     # Validation arguments
     parser.add_argument("--val-dir", type=str, default=None,
                         help="Directory containing validation shard_*.pt files. "
@@ -95,46 +95,47 @@ def main():
                         help="Override early stopping patience")
     parser.add_argument("--val-subset", type=float, default=None,
                         help="Fraction of validation shards to use (0.0-1.0)")
-    
+
     # Performance arguments
     parser.add_argument("--mixed-precision", action="store_true",
                         help="Use bfloat16 mixed precision training (recommended for A100)")
-    
+
     args = parser.parse_args()
 
-    if args.epochs:
+    if args.epochs is not None:
         CONFIG['epochs'] = args.epochs
-    if args.checkpoint_every:
+    if args.checkpoint_every is not None:
         CONFIG['checkpoint_every_n_epochs'] = args.checkpoint_every
-    if args.early_stopping_patience:
+    if args.early_stopping_patience is not None:
         CONFIG['early_stopping_patience'] = args.early_stopping_patience
-    if args.val_subset:
+    if args.val_subset is not None:
         CONFIG['val_subset_fraction'] = args.val_subset
 
-    killer = GracefulKiller()
+    if args.k_fraction is not None:
+        CONFIG['k_fraction'] = args.k_fraction
+    if args.per_init is not None:
+        CONFIG['per_init'] = args.per_init
+
+    k = int(CONFIG['k_fraction'] * CONFIG['d_model'])
+    print(f"k_fraction: {CONFIG['k_fraction']} (k={k})")
+    print(f"per_init: {CONFIG['per_init']}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
     # Enable TF32 for free speedup on Ampere+ GPUs (A100, etc.)
-    # TF32 uses tensor cores with minimal precision impact
     if device == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         print("TF32 enabled for matrix multiplications")
-    
+
     print(f"Running {args.model_type} on {device}")
     print(f"PyTorch version: {torch.__version__}")
     if device == "cuda":
         print(f"CUDA device: {torch.cuda.get_device_name(0)}")
 
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    k = int(CONFIG['k_fraction'] * CONFIG['d_model'])
-    run_suffix = f"_d{CONFIG['d_model']}_k{k}"
-    if args.model_type == "RA-SAE":
-        run_suffix += f"_delta{CONFIG['delta']}"
-    elif args.model_type == "SI-SAE":
-        run_suffix += f"_per_init{CONFIG['per_init']}"
+
+    run_suffix = build_run_suffix(args.model_type, CONFIG)
 
     # Update checkpoint directory call to use the suffix
     checkpoint_dir = get_checkpoint_dir(args.checkpoint_dir, args.model_type, run_suffix)
@@ -145,34 +146,47 @@ def main():
     shard_files = sorted(glob.glob(os.path.join(args.shard_directory, 'shard_*.pt')))
     if not shard_files:
         raise FileNotFoundError(f"No .pt shards found in {args.shard_directory}")
-    
+
     print(f"Found {len(shard_files)} training shard files")
-        
+
     first_shard = torch.load(shard_files[0], map_location='cpu', weights_only=True)
     d_brain = first_shard.shape[-1]
+    samples_per_shard = first_shard.shape[0]
+    CONFIG['dataset_size'] = len(shard_files) * samples_per_shard
     print(f"Detected embedding dimension: {d_brain}")
+    print(f"Estimated dataset size: {CONFIG['dataset_size']} ({len(shard_files)} shards x {samples_per_shard} samples)")
 
     mean, std = get_dataset_stats(args.shard_directory)
     normalizer = GPUNormalizer(mean, std).to(device)
     raw_loader = create_dataloader(
-        args.shard_directory, 
-        CONFIG['batch_size'], 
-        num_workers=CONFIG['num_workers'], 
+        args.shard_directory,
+        CONFIG['batch_size'],
+        num_workers=CONFIG['num_workers'],
         prefetch_factor=CONFIG['prefetch_factor']
     )
     loader = DeviceDataLoader(raw_loader, device, normalizer)
-    
+
+    # --- Eval-only mode ---
+    if args.eval_only:
+        print("\n** Eval-only mode **")
+        run_evaluation(
+            CONFIG, args, device, loader, d_brain,
+            run_suffix=run_suffix, centers_dir=args.centers_dir,
+        )
+        print("\nDone (eval-only).")
+        return
+
     # --- Validation Data ---
     val_loader = None
     early_stopping_patience = None
-    
+
     if args.val_dir:
         val_shard_files = sorted(glob.glob(os.path.join(args.val_dir, 'shard_*.pt')))
         if not val_shard_files:
             print(f"[Warning] No validation shards found in {args.val_dir}. Disabling validation.")
         else:
             print(f"Found {len(val_shard_files)} validation shard files")
-            
+
             # Try to get validation stats, fall back to training stats
             try:
                 val_mean, val_std = get_dataset_stats(args.val_dir)
@@ -181,7 +195,7 @@ def main():
             except FileNotFoundError:
                 print("No validation stats found, using training stats for normalization")
                 val_normalizer = normalizer
-            
+
             raw_val_loader = create_val_dataloader(
                 args.val_dir,
                 CONFIG['val_batch_size'],
@@ -192,7 +206,7 @@ def main():
             val_loader = DeviceDataLoader(raw_val_loader, device, val_normalizer)
             print(f"Validation enabled with {len(val_shard_files)} shards "
                   f"(using {CONFIG['val_subset_fraction']*100:.0f}%)")
-            
+
             # Enable early stopping unless explicitly disabled
             if not args.no_early_stopping:
                 early_stopping_patience = CONFIG['early_stopping_patience']
@@ -202,79 +216,69 @@ def main():
     else:
         print("No validation directory provided. Training without validation.")
 
-    k = int(CONFIG['k_fraction'] * CONFIG['d_model'])
+    # --- Training ---
+    killer = GracefulKiller()
+
     print(f"Config: d_model={CONFIG['d_model']}, k={k}, epochs={CONFIG['epochs']}")
-    
+
     all_dictionaries = []
     all_results = {}
-    
-    if args.single_sae:
-        sae_indices = [args.single_sae]
-    else:
-        sae_indices = list(range(args.start_sae, CONFIG['num_saes'] + 1))
-    
+
+    sae_indices = list(range(1, CONFIG['num_saes'] + 1))
     for i in sae_indices:
         if killer.kill_now:
             print("[Signal] Stopping before next SAE due to shutdown signal")
             break
-            
+
         print(f"\n{'='*60}")
         print(f"--- SAE {i}/{CONFIG['num_saes']} ---")
         print(f"{'='*60}")
-        
+
         model_id = f"sae_{i}_{args.model_type}{run_suffix}"
         save_path = os.path.join(args.output_dir, f"{model_id}_state_dict.pth")
-        
+
         if os.path.exists(save_path) and is_training_complete(checkpoint_dir, i, CONFIG['epochs']):
             print(f"Loading existing completed model from {save_path}")
             sae = get_sae_model(
-                args.model_type, d_brain, CONFIG['d_model'], k, device, loader, CONFIG
+                args.model_type, d_brain, CONFIG['d_model'], k, device, loader, CONFIG,
+                centers_dir=args.centers_dir,
             )
             sae.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
         else:
             print("Training (will resume from checkpoint if available)...")
-            
+
             sae = get_sae_model(
-                args.model_type, d_brain, CONFIG['d_model'], k, device, loader, CONFIG
+                args.model_type, d_brain, CONFIG['d_model'], k, device, loader, CONFIG,
+                centers_dir=args.centers_dir,
             )
-            
+
             optimizer = torch.optim.Adam(sae.parameters(), lr=CONFIG['lr'])
-            num_step_epoch = 250_000_000 // CONFIG['batch_size']
-            
+            num_step_epoch = CONFIG['dataset_size'] // CONFIG['batch_size']
+
             total_steps = num_step_epoch * CONFIG['epochs']
-            warmup_steps = num_step_epoch * 15
-            
+            warmup_steps = total_steps //4
+
             warmup = torch.optim.lr_scheduler.LinearLR(
-                optimizer, 
-                start_factor=0.001, 
-                end_factor=1.0, 
+                optimizer,
+                start_factor=0.001,
+                end_factor=1.0,
                 total_iters=warmup_steps
             )
 
             # 3. Define the Decay Phase
             decay = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, 
-                T_max=(total_steps - warmup_steps), 
+                optimizer,
+                T_max=(total_steps - warmup_steps),
                 eta_min=CONFIG['lr'] * 0.05
             )
 
             # 4. Chain them together
             scheduler = torch.optim.lr_scheduler.SequentialLR(
-                optimizer, 
-                schedulers=[warmup, decay], 
+                optimizer,
+                schedulers=[warmup, decay],
                 milestones=[warmup_steps]
             )
 
-            def criterion(x, x_hat, pre_codes, codes, dictionary):
-                loss = (x - x_hat).square().mean()
-
-                # add reanimation loss to avoid dead codes:
-                is_dead = ((codes > 0).sum(dim=0) == 0).float().detach()
-                reanim_loss = (pre_codes * is_dead[None, :]).mean()
-                loss -= reanim_loss * 1e-3
-
-                return loss
-            
             logs = train_sae(
                 sae, loader, criterion, optimizer,
                 scheduler=scheduler,
@@ -292,15 +296,22 @@ def main():
                 # Performance
                 use_mixed_precision=args.mixed_precision
             )
-            
+
             torch.save(sae.state_dict(), save_path)
             print(f"Saved final model to {save_path}")
 
-        
-        print("Running evaluation...")
+
+        print("Running evaluation on training data...")
         with torch.inference_mode():
             metrics, dictionary = evaluate_sae(sae, loader, device)
-        
+
+        if val_loader is not None:
+            print("Running evaluation on validation data...")
+            with torch.inference_mode():
+                val_metrics, _ = evaluate_sae(sae, val_loader, device)
+            for key, val in val_metrics.items():
+                metrics[f"val_{key}"] = val
+
         all_results[f"sae_{i}"] = metrics
         all_dictionaries.append(dictionary)
         print(f"SAE {i} Metrics: {json.dumps(metrics, indent=2)}")
@@ -309,7 +320,7 @@ def main():
         print(f"\n[Warning] Only completed {len(all_results)}/{CONFIG['num_saes']} SAEs")
         if killer.kill_now:
             print("Training was interrupted. Run again to continue.")
-        
+
         partial_output = {
             "CONFIG": CONFIG,
             "completed_saes": list(all_results.keys()),
@@ -322,14 +333,10 @@ def main():
         return
 
     print("\n--- Aggregating Results ---")
-    avg_metrics = {}
-    metric_keys = all_results["sae_1"].keys()
-    for key in metric_keys:
-        vals = [all_results[f"sae_{j}"][key] for j in range(1, CONFIG['num_saes'] + 1)]
-        avg_metrics[f"avg_{key}"] = sum(vals) / len(vals)
+    avg_metrics = aggregate_metrics(all_results)
 
     stability_metrics = compute_pairwise_stability(all_dictionaries, device)
-    
+
     final_output = {
         "CONFIG": CONFIG,
         "individual_averages": avg_metrics,
@@ -341,7 +348,7 @@ def main():
     print("FINAL RESULTS")
     print("="*60)
     print(json.dumps(final_output, indent=2))
-    
+
     results_path = os.path.join(args.output_dir, f"final_results_{args.model_type}{run_suffix}.json")
     with open(results_path, "w") as f:
         json.dump(final_output, f, indent=2)

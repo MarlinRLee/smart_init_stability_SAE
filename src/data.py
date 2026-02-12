@@ -29,7 +29,9 @@ class ShardedDataset(IterableDataset):
             shard_indices = list(range(worker_info.id, len(self.shard_files), worker_info.num_workers))
 
         if self.shuffle_shards:
-            np.random.shuffle(shard_indices)
+            # Use OS-seeded RNG so each worker gets a unique shuffle
+            rng = np.random.default_rng()
+            rng.shuffle(shard_indices)
 
         for shard_idx in shard_indices:
             try:
@@ -64,7 +66,7 @@ class GPUNormalizer(nn.Module):
         
     def forward(self, x):
         # Cast to float for precision during norm, output float32
-        return (x.float() - self.mean) / (self.std + 1e-8)#.half()#
+        return (x.float() - self.mean) / (self.std + 1e-8)
 
 class DeviceDataLoader:
     """Wraps a dataloader to move batches to device and normalize them."""
@@ -88,8 +90,8 @@ class DeviceDataLoader:
         return len(self.dataloader)
 
 # --- 4. The Setup Function ---
-def create_dataloader(shard_dir, total_batch_size, num_workers=16, prefetch_factor=6, 
-                      subset_fraction=.1, shuffle=True):
+def create_dataloader(shard_dir, total_batch_size, num_workers=9, prefetch_factor=6, 
+                      subset_fraction=1.0, shuffle=True):
     """
     Create a dataloader for sharded data.
     
@@ -114,7 +116,11 @@ def create_dataloader(shard_dir, total_batch_size, num_workers=16, prefetch_fact
         PyTorch DataLoader instance.
     """
     batch_per_worker = total_batch_size // num_workers
-    
+    if total_batch_size % num_workers != 0:
+        effective = batch_per_worker * num_workers
+        print(f"[Warning] total_batch_size ({total_batch_size}) not divisible by "
+              f"num_workers ({num_workers}). Effective batch size: {effective}")
+
     dataset = ShardedDataset(
         shard_dir, 
         batch_size_per_worker=batch_per_worker,
@@ -128,13 +134,13 @@ def create_dataloader(shard_dir, total_batch_size, num_workers=16, prefetch_fact
 
     return DataLoader(
         dataset,
-        batch_size=num_workers,
+        batch_size=max(1, num_workers),
         num_workers=num_workers,
         pin_memory=True,
-        prefetch_factor=prefetch_factor, 
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=False,
         collate_fn=fast_collate,
-        drop_last=True 
+        drop_last=True
     )
 
 

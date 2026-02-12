@@ -2,16 +2,16 @@ import os
 import torch
 import torch.nn as nn
 from overcomplete.sae import TopKSAE, RATopKSAE
-from .utils import cosine_kmeans
+from utils import cosine_kmeans
 
-def get_sae_model(model_type, d_brain, d_model, k, device, dataloader, config):
+def get_sae_model(model_type, d_brain, d_model, k, device, dataloader, config, centers_dir="../centers"):
     """
     Factory to build or load the correct SAE variant.
     Handles the specific initialization logic for RA-SAE and SI-SAE.
     """
     if model_type == "RA-SAE":
         # RA-SAE requires pre-computed centers
-        centers_path = f"../centers/centers_{config['n_candidates']}.pt"
+        centers_path = os.path.join(centers_dir, f"centers_{config['n_candidates']}.pt")
         if os.path.exists(centers_path):
             print(f"Loading cached centers from {centers_path}")
             c_tensor = torch.load(centers_path, map_location=device, weights_only=True)
@@ -19,7 +19,7 @@ def get_sae_model(model_type, d_brain, d_model, k, device, dataloader, config):
             c_tensor = cosine_kmeans(dataloader, config['n_candidates'], d_brain)
             torch.save(c_tensor, centers_path)
             
-        sae = RATopKSAE(d_brain, nb_concepts=d_model, top_k=k, points=torch.tensor(c_tensor).float().cuda(),
+        sae = RATopKSAE(d_brain, nb_concepts=d_model, top_k=k, points=c_tensor.float().to(device),
                 delta=config['delta'], device=device)
         return sae
 
@@ -32,7 +32,7 @@ def get_sae_model(model_type, d_brain, d_model, k, device, dataloader, config):
         return sae
     elif model_type == "SI-SAE":
         # SI-SAE or base SAE Logic: Initialize Standard SAE with Noisy K-Means Centroids
-        si_path = f"../centers/si_centers_{d_model}.pt"
+        si_path = os.path.join(centers_dir, f"si_centers_{d_model}.pt")
         if os.path.exists(si_path):
             si_centers = torch.load(si_path, map_location=device, weights_only=True)
         else:
